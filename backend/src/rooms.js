@@ -85,20 +85,24 @@ export function joinTier({ tier, userId, username }) {
     }
   }
 
+  // Determine the room id up-front so the escrow tx can reference it even
+  // when this player is the one creating a new room.
+  const newRoomId = room ? null : nanoid(10);
+  const refId = room?.id ?? newRoomId;
+
   // Escrow entry amount.
-  adjustBalance({ userId, kind: 'room_entry', amount: -tier, ref: room?.id ?? null });
+  adjustBalance({ userId, kind: 'room_entry', amount: -tier, ref: refId });
 
   if (!room) {
-    const id = nanoid(10);
     room = {
-      id,
+      id: newRoomId,
       tier,
       status: 'waiting',
       players: [{ userId, username }],
       gameId: null,
       createdAt: Date.now(),
     };
-    rooms.set(id, room);
+    rooms.set(newRoomId, room);
     return { room, started: false };
   }
 
@@ -175,7 +179,7 @@ export function doMove({ gameId, userId, tokenIdx }) {
 function finalizeGame(g) {
   const state = g.state;
   const pot = state.entryAmount * state.players.length;
-  const rake = Math.floor((pot * RAKE_PERCENT) / 100);
+  const rake = Math.floor((pot * state.rakePercent) / 100);
   const payout = pot - rake;
   const winnerIdx = state.winner;
   const winnerId = state.players[winnerIdx].userId;

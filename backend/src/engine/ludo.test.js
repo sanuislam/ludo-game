@@ -174,6 +174,17 @@ test('no-move roll passes turn automatically', () => {
   assert.equal(g.lastRoll, null);
 });
 
+test('malicious out-of-range tokenIdx is rejected, state stays clean', () => {
+  const g = newGame();
+  applyRoll(g, { rollOverride: 6 });
+  const before = JSON.stringify(g.players[0].tokens);
+  assert.throws(() => applyMove(g, { tokenIdx: 5 }), /illegal move/i);
+  assert.throws(() => applyMove(g, { tokenIdx: -1 }), /illegal move/i);
+  assert.throws(() => applyMove(g, { tokenIdx: 1.5 }), /illegal move/i);
+  assert.equal(g.players[0].tokens.length, 4);
+  assert.equal(JSON.stringify(g.players[0].tokens), before);
+});
+
 test('snapshot is serialisable and has no functions', () => {
   const g = newGame();
   applyRoll(g, { rollOverride: 6 });

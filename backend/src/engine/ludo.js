@@ -123,6 +123,13 @@ export function legalMoves(state, roll) {
 }
 
 function canMove(state, playerIdx, tokenIdx, roll) {
+  if (
+    !Number.isInteger(tokenIdx) ||
+    tokenIdx < 0 ||
+    tokenIdx >= TOKENS_PER_PLAYER
+  ) {
+    return false;
+  }
   const player = state.players[playerIdx];
   const progress = player.tokens[tokenIdx];
 
