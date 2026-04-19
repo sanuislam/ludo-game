@@ -3,21 +3,32 @@
 2-player real-time multiplayer Ludo game with virtual coin wallet.
 
 ## Stack
-- Backend: Node.js, Express, Socket.IO, better-sqlite3, JWT auth
+- Backend: Node.js, Express, Socket.IO, PostgreSQL (`pg`), JWT auth
 - Frontend: React + Vite, Socket.IO client, Zustand, React Router
 - Game engine: pure, deterministic, server-authoritative (unit-tested)
 
 ## Run locally
 
-### Backend
+### 1. Start Postgres
+A `docker-compose.yml` at the repo root runs a local Postgres with the
+credentials the backend expects by default:
+
+```bash
+docker compose up -d postgres
+```
+
+Or point `DATABASE_URL` at any Postgres you prefer (see `backend/.env.example`).
+Tables are created automatically on first backend boot.
+
+### 2. Backend
 ```bash
 cd backend
 npm install
-cp .env.example .env   # optional; defaults work for local dev
+cp .env.example .env   # optional; defaults work with docker-compose
 npm start              # http://localhost:4000
 ```
 
-### Frontend
+### 3. Frontend
 ```bash
 cd frontend
 npm install
@@ -32,6 +43,7 @@ only when deploying against a non-local backend.
 ```bash
 cd backend && npm test
 ```
+Engine tests are pure and don't require a database.
 
 ## How to play
 1. Sign up (you get 1,000 starter virtual coins).

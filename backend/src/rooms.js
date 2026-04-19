@@ -1,5 +1,5 @@
 import { nanoid } from 'nanoid';
-import { db } from './db.js';
+import { query } from './db.js';
 import { adjustBalance } from './wallet.js';
 import {
   createGame,
@@ -21,8 +21,33 @@ const DISCONNECT_GRACE_MS = 30_000;
 
 /** In-memory room/game store. */
 const rooms = new Map(); // roomId -> Room
-const games = new Map(); // gameId -> { state, roomId, turnTimer, disconnectTimers }
+const games = new Map(); // gameId -> { state, roomId, disconnectTimers }
 const userActiveGame = new Map(); // userId -> gameId
+
+/**
+ * Serial mutex for room-lifecycle operations.
+ *
+ * Postgres access is async, so joinTier / leaveWaitingRoom have `await`
+ * yield points between in-memory state reads (e.g. "is this room still
+ * waiting?") and mutations (e.g. "push player, flip to playing"). Without
+ * serialisation two concurrent `room:join` events at the same tier could
+ * both claim the same waiting slot, both deduct coins, then one call would
+ * find the room already full and throw — leaving one player's coins
+ * debited with no game to show for it.
+ *
+ * This is a minimal promise-chain lock (fine for in-process socket
+ * handlers). Every room-mutating entrypoint runs under `withRoomsLock`.
+ */
+let roomsLockChain = Promise.resolve();
+function withRoomsLock(fn) {
+  const run = () => Promise.resolve().then(fn);
+  const next = roomsLockChain.then(run, run);
+  roomsLockChain = next.then(
+    () => {},
+    () => {},
+  );
+  return next;
+}
 
 /**
  * Room lifecycle:
@@ -73,78 +98,99 @@ export function getUserActiveGame(userId) {
  * Returns { room, started, game? }.
  */
 export function joinTier({ tier, userId, username }) {
-  if (!ROOM_TIERS.includes(tier)) throw new Error('invalid tier');
-  if (userActiveGame.has(userId)) throw new Error('you are already in a game');
+  return withRoomsLock(async () => {
+    if (!ROOM_TIERS.includes(tier)) throw new Error('invalid tier');
+    if (userActiveGame.has(userId)) throw new Error('you are already in a game');
 
-  // find oldest waiting room at this tier that the user is NOT already in
-  let room = null;
-  for (const r of rooms.values()) {
-    if (r.tier === tier && r.status === 'waiting' && !r.players.some((p) => p.userId === userId)) {
-      room = r;
-      break;
+    // Find oldest waiting room at this tier that the user is NOT already in.
+    let room = null;
+    for (const r of rooms.values()) {
+      if (r.tier === tier && r.status === 'waiting' && !r.players.some((p) => p.userId === userId)) {
+        room = r;
+        break;
+      }
     }
-  }
 
-  // Determine the room id up-front so the escrow tx can reference it even
-  // when this player is the one creating a new room.
-  const newRoomId = room ? null : nanoid(10);
-  const refId = room?.id ?? newRoomId;
+    // Claim the room/seat in memory BEFORE awaiting the DB, so no concurrent
+    // handler (in a future non-locked world) could see the same waiting slot.
+    // Under the rooms-lock this is already safe; belt-and-braces.
+    let newRoomId = null;
+    if (room) {
+      room.players.push({ userId, username });
+      room.status = 'playing';
+    } else {
+      newRoomId = nanoid(10);
+      room = {
+        id: newRoomId,
+        tier,
+        status: 'waiting',
+        players: [{ userId, username }],
+        gameId: null,
+        createdAt: Date.now(),
+      };
+      rooms.set(newRoomId, room);
+    }
+    const refId = room.id;
 
-  // Escrow entry amount.
-  adjustBalance({ userId, kind: 'room_entry', amount: -tier, ref: refId });
+    // Escrow entry amount. If this throws (insufficient coins), unclaim.
+    try {
+      await adjustBalance({ userId, kind: 'room_entry', amount: -tier, ref: refId });
+    } catch (err) {
+      if (newRoomId) {
+        rooms.delete(newRoomId);
+      } else {
+        const idx = room.players.findIndex((p) => p.userId === userId);
+        if (idx >= 0) room.players.splice(idx, 1);
+        room.status = 'waiting';
+      }
+      throw err;
+    }
 
-  if (!room) {
-    room = {
-      id: newRoomId,
-      tier,
-      status: 'waiting',
-      players: [{ userId, username }],
-      gameId: null,
-      createdAt: Date.now(),
-    };
-    rooms.set(newRoomId, room);
-    return { room, started: false };
-  }
+    if (room.status === 'waiting') {
+      return { room, started: false };
+    }
 
-  // Second player — start the game.
-  room.players.push({ userId, username });
-  room.status = 'playing';
+    // Second player just arrived — start the game.
+    const gameId = nanoid(10);
+    const state = createGame({
+      gameId,
+      roomId: room.id,
+      players: room.players,
+      entryAmount: tier,
+      rakePercent: RAKE_PERCENT,
+    });
+    room.gameId = gameId;
 
-  const gameId = nanoid(10);
-  const state = createGame({
-    gameId,
-    roomId: room.id,
-    players: room.players,
-    entryAmount: tier,
-    rakePercent: RAKE_PERCENT,
+    await query(
+      `INSERT INTO games (id, room_id, entry_amount, player0_id, player1_id, started_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [gameId, room.id, tier, room.players[0].userId, room.players[1].userId, Date.now()],
+    );
+
+    games.set(gameId, {
+      state,
+      roomId: room.id,
+      disconnectTimers: new Map(),
+    });
+    for (const p of room.players) userActiveGame.set(p.userId, gameId);
+
+    return { room, started: true, game: state };
   });
-  room.gameId = gameId;
-
-  db.prepare(
-    'INSERT INTO games (id, room_id, entry_amount, player0_id, player1_id, started_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).run(gameId, room.id, tier, room.players[0].userId, room.players[1].userId, Date.now());
-
-  games.set(gameId, {
-    state,
-    roomId: room.id,
-    disconnectTimers: new Map(),
-  });
-  for (const p of room.players) userActiveGame.set(p.userId, gameId);
-
-  return { room, started: true, game: state };
 }
 
 /** Leave a waiting room (before the game starts). Refunds the entry amount. */
 export function leaveWaitingRoom({ roomId, userId }) {
-  const r = rooms.get(roomId);
-  if (!r) throw new Error('room not found');
-  if (r.status !== 'waiting') throw new Error('cannot leave a room that is in play');
-  const idx = r.players.findIndex((p) => p.userId === userId);
-  if (idx < 0) throw new Error('not in this room');
-  r.players.splice(idx, 1);
-  adjustBalance({ userId, kind: 'room_refund', amount: r.tier, ref: r.id });
-  if (r.players.length === 0) rooms.delete(r.id);
-  return r;
+  return withRoomsLock(async () => {
+    const r = rooms.get(roomId);
+    if (!r) throw new Error('room not found');
+    if (r.status !== 'waiting') throw new Error('cannot leave a room that is in play');
+    const idx = r.players.findIndex((p) => p.userId === userId);
+    if (idx < 0) throw new Error('not in this room');
+    r.players.splice(idx, 1);
+    await adjustBalance({ userId, kind: 'room_refund', amount: r.tier, ref: r.id });
+    if (r.players.length === 0) rooms.delete(r.id);
+    return r;
+  });
 }
 
 /** Roll dice for the current player's turn. */
@@ -161,7 +207,7 @@ export function doRoll({ gameId, userId }) {
 }
 
 /** Move a token for the current player. */
-export function doMove({ gameId, userId, tokenIdx }) {
+export async function doMove({ gameId, userId, tokenIdx }) {
   const g = games.get(gameId);
   if (!g) throw new Error('game not found');
   const state = g.state;
@@ -169,14 +215,14 @@ export function doMove({ gameId, userId, tokenIdx }) {
   const currentPlayer = state.players[state.turn];
   if (currentPlayer.userId !== userId) throw new Error('not your turn');
   const result = applyMove(state, { tokenIdx });
-  if (state.winner != null) finalizeGame(g);
+  if (state.winner != null) await finalizeGame(g);
   return result;
 }
 
 /**
  * Finalise a finished game — credit winner, record rake, persist final state.
  */
-function finalizeGame(g) {
+async function finalizeGame(g) {
   const state = g.state;
   const pot = state.entryAmount * state.players.length;
   const rake = Math.floor((pot * state.rakePercent) / 100);
@@ -184,16 +230,19 @@ function finalizeGame(g) {
   const winnerIdx = state.winner;
   const winnerId = state.players[winnerIdx].userId;
 
-  adjustBalance({
+  await adjustBalance({
     userId: winnerId,
     kind: 'room_winnings',
     amount: payout,
     ref: state.id,
   });
 
-  db.prepare(
-    'UPDATE games SET winner_id = ?, rake = ?, payout = ?, finished_at = ?, history_json = ? WHERE id = ?',
-  ).run(winnerId, rake, payout, state.finishedAt || Date.now(), JSON.stringify(state.history), state.id);
+  await query(
+    `UPDATE games
+       SET winner_id = $1, rake = $2, payout = $3, finished_at = $4, history_json = $5
+     WHERE id = $6`,
+    [winnerId, rake, payout, state.finishedAt || Date.now(), JSON.stringify(state.history), state.id],
+  );
 
   for (const p of state.players) userActiveGame.delete(p.userId);
 
@@ -216,7 +265,9 @@ export function startDisconnectTimer({ gameId, userId, onForfeit }) {
   if (!g) return;
   if (g.state.winner != null) return;
   const timer = setTimeout(() => {
-    forfeitGame({ gameId, forfeitingUserId: userId, onForfeit });
+    forfeitGame({ gameId, forfeitingUserId: userId, onForfeit }).catch((err) => {
+      console.error('forfeitGame failed', err);
+    });
   }, DISCONNECT_GRACE_MS);
   g.disconnectTimers.set(userId, timer);
 }
@@ -231,7 +282,7 @@ export function cancelDisconnectTimer({ gameId, userId }) {
   }
 }
 
-function forfeitGame({ gameId, forfeitingUserId, onForfeit }) {
+async function forfeitGame({ gameId, forfeitingUserId, onForfeit }) {
   const g = games.get(gameId);
   if (!g || g.state.winner != null) return;
   const loserIdx = g.state.players.findIndex((p) => p.userId === forfeitingUserId);
@@ -240,7 +291,7 @@ function forfeitGame({ gameId, forfeitingUserId, onForfeit }) {
   g.state.winner = winnerIdx;
   g.state.finishedAt = Date.now();
   g.state.history.push({ type: 'forfeit', player: loserIdx });
-  finalizeGame(g);
+  await finalizeGame(g);
   if (onForfeit) onForfeit({ game: g, winnerIdx, loserIdx });
 }
 

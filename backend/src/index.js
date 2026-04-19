@@ -6,6 +6,7 @@ import { authRouter } from './auth.js';
 import { walletRouter } from './wallet.js';
 import { attachSocket } from './socket.js';
 import { listLobby, ROOM_TIERS } from './rooms.js';
+import { initDb } from './db.js';
 
 const PORT = Number(process.env.PORT || 4000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
@@ -29,6 +30,13 @@ app.use((err, _req, res, _next) => {
 const httpServer = http.createServer(app);
 attachSocket(httpServer, CORS_ORIGIN);
 
-httpServer.listen(PORT, () => {
-  console.log(`Ludo backend listening on :${PORT} (CORS: ${CORS_ORIGIN})`);
-});
+initDb()
+  .then(() => {
+    httpServer.listen(PORT, () => {
+      console.log(`Ludo backend listening on :${PORT} (CORS: ${CORS_ORIGIN})`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialise database:', err);
+    process.exit(1);
+  });

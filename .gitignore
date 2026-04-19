@@ -6,7 +6,5 @@ build/
 *.log
 .DS_Store
 backend/data/
-backend/*.db
-backend/*.db-journal
 coverage/
 .vite/
