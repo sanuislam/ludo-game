@@ -18,13 +18,17 @@ export function attachSocket(httpServer, corsOrigin) {
     cors: { origin: corsOrigin, credentials: true },
   });
 
-  io.use((socket, next) => {
-    const token = socket.handshake.auth?.token;
-    if (!token) return next(new Error('unauthenticated'));
-    const user = verifyToken(token);
-    if (!user) return next(new Error('invalid token'));
-    socket.data.user = user;
-    next();
+  io.use(async (socket, next) => {
+    try {
+      const token = socket.handshake.auth?.token;
+      if (!token) return next(new Error('unauthenticated'));
+      const user = await verifyToken(token);
+      if (!user) return next(new Error('invalid token'));
+      socket.data.user = user;
+      next();
+    } catch (err) {
+      next(err);
+    }
   });
 
   function emitLobby() {
@@ -56,9 +60,9 @@ export function attachSocket(httpServer, corsOrigin) {
       if (typeof ack === 'function') ack({ ok: true, tiers: listLobby() });
     });
 
-    socket.on('room:join', ({ tier } = {}, ack) => {
+    socket.on('room:join', async ({ tier } = {}, ack) => {
       try {
-        const result = joinTier({ tier, userId: user.id, username: user.username });
+        const result = await joinTier({ tier, userId: user.id, username: user.username });
         socket.join(`room:${result.room.id}`);
         if (result.started) {
           socket.join(`game:${result.game.id}`);
@@ -87,9 +91,9 @@ export function attachSocket(httpServer, corsOrigin) {
       }
     });
 
-    socket.on('room:leave', ({ roomId } = {}, ack) => {
+    socket.on('room:leave', async ({ roomId } = {}, ack) => {
       try {
-        leaveWaitingRoom({ roomId, userId: user.id });
+        await leaveWaitingRoom({ roomId, userId: user.id });
         socket.leave(`room:${roomId}`);
         emitLobby();
         if (typeof ack === 'function') ack({ ok: true });
@@ -108,9 +112,9 @@ export function attachSocket(httpServer, corsOrigin) {
       }
     });
 
-    socket.on('game:move', ({ gameId, tokenIdx } = {}, ack) => {
+    socket.on('game:move', async ({ gameId, tokenIdx } = {}, ack) => {
       try {
-        const result = doMove({ gameId, userId: user.id, tokenIdx });
+        const result = await doMove({ gameId, userId: user.id, tokenIdx });
         emitGameState(gameId);
         if (result.won) {
           io.to(`game:${gameId}`).emit('game:over', gameSnapshot(getGame(gameId)));

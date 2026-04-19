@@ -1,5 +1,5 @@
 import { nanoid } from 'nanoid';
-import { db } from './db.js';
+import { query } from './db.js';
 import { adjustBalance } from './wallet.js';
 import {
   createGame,
@@ -21,7 +21,7 @@ const DISCONNECT_GRACE_MS = 30_000;
 
 /** In-memory room/game store. */
 const rooms = new Map(); // roomId -> Room
-const games = new Map(); // gameId -> { state, roomId, turnTimer, disconnectTimers }
+const games = new Map(); // gameId -> { state, roomId, disconnectTimers }
 const userActiveGame = new Map(); // userId -> gameId
 
 /**
@@ -72,7 +72,7 @@ export function getUserActiveGame(userId) {
  * Deducts the entry amount from the player's wallet immediately (escrow).
  * Returns { room, started, game? }.
  */
-export function joinTier({ tier, userId, username }) {
+export async function joinTier({ tier, userId, username }) {
   if (!ROOM_TIERS.includes(tier)) throw new Error('invalid tier');
   if (userActiveGame.has(userId)) throw new Error('you are already in a game');
 
@@ -91,7 +91,7 @@ export function joinTier({ tier, userId, username }) {
   const refId = room?.id ?? newRoomId;
 
   // Escrow entry amount.
-  adjustBalance({ userId, kind: 'room_entry', amount: -tier, ref: refId });
+  await adjustBalance({ userId, kind: 'room_entry', amount: -tier, ref: refId });
 
   if (!room) {
     room = {
@@ -120,9 +120,11 @@ export function joinTier({ tier, userId, username }) {
   });
   room.gameId = gameId;
 
-  db.prepare(
-    'INSERT INTO games (id, room_id, entry_amount, player0_id, player1_id, started_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).run(gameId, room.id, tier, room.players[0].userId, room.players[1].userId, Date.now());
+  await query(
+    `INSERT INTO games (id, room_id, entry_amount, player0_id, player1_id, started_at)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [gameId, room.id, tier, room.players[0].userId, room.players[1].userId, Date.now()],
+  );
 
   games.set(gameId, {
     state,
@@ -135,14 +137,14 @@ export function joinTier({ tier, userId, username }) {
 }
 
 /** Leave a waiting room (before the game starts). Refunds the entry amount. */
-export function leaveWaitingRoom({ roomId, userId }) {
+export async function leaveWaitingRoom({ roomId, userId }) {
   const r = rooms.get(roomId);
   if (!r) throw new Error('room not found');
   if (r.status !== 'waiting') throw new Error('cannot leave a room that is in play');
   const idx = r.players.findIndex((p) => p.userId === userId);
   if (idx < 0) throw new Error('not in this room');
   r.players.splice(idx, 1);
-  adjustBalance({ userId, kind: 'room_refund', amount: r.tier, ref: r.id });
+  await adjustBalance({ userId, kind: 'room_refund', amount: r.tier, ref: r.id });
   if (r.players.length === 0) rooms.delete(r.id);
   return r;
 }
@@ -161,7 +163,7 @@ export function doRoll({ gameId, userId }) {
 }
 
 /** Move a token for the current player. */
-export function doMove({ gameId, userId, tokenIdx }) {
+export async function doMove({ gameId, userId, tokenIdx }) {
   const g = games.get(gameId);
   if (!g) throw new Error('game not found');
   const state = g.state;
@@ -169,14 +171,14 @@ export function doMove({ gameId, userId, tokenIdx }) {
   const currentPlayer = state.players[state.turn];
   if (currentPlayer.userId !== userId) throw new Error('not your turn');
   const result = applyMove(state, { tokenIdx });
-  if (state.winner != null) finalizeGame(g);
+  if (state.winner != null) await finalizeGame(g);
   return result;
 }
 
 /**
  * Finalise a finished game — credit winner, record rake, persist final state.
  */
-function finalizeGame(g) {
+async function finalizeGame(g) {
   const state = g.state;
   const pot = state.entryAmount * state.players.length;
   const rake = Math.floor((pot * state.rakePercent) / 100);
@@ -184,16 +186,19 @@ function finalizeGame(g) {
   const winnerIdx = state.winner;
   const winnerId = state.players[winnerIdx].userId;
 
-  adjustBalance({
+  await adjustBalance({
     userId: winnerId,
     kind: 'room_winnings',
     amount: payout,
     ref: state.id,
   });
 
-  db.prepare(
-    'UPDATE games SET winner_id = ?, rake = ?, payout = ?, finished_at = ?, history_json = ? WHERE id = ?',
-  ).run(winnerId, rake, payout, state.finishedAt || Date.now(), JSON.stringify(state.history), state.id);
+  await query(
+    `UPDATE games
+       SET winner_id = $1, rake = $2, payout = $3, finished_at = $4, history_json = $5
+     WHERE id = $6`,
+    [winnerId, rake, payout, state.finishedAt || Date.now(), JSON.stringify(state.history), state.id],
+  );
 
   for (const p of state.players) userActiveGame.delete(p.userId);
 
@@ -216,7 +221,9 @@ export function startDisconnectTimer({ gameId, userId, onForfeit }) {
   if (!g) return;
   if (g.state.winner != null) return;
   const timer = setTimeout(() => {
-    forfeitGame({ gameId, forfeitingUserId: userId, onForfeit });
+    forfeitGame({ gameId, forfeitingUserId: userId, onForfeit }).catch((err) => {
+      console.error('forfeitGame failed', err);
+    });
   }, DISCONNECT_GRACE_MS);
   g.disconnectTimers.set(userId, timer);
 }
@@ -231,7 +238,7 @@ export function cancelDisconnectTimer({ gameId, userId }) {
   }
 }
 
-function forfeitGame({ gameId, forfeitingUserId, onForfeit }) {
+async function forfeitGame({ gameId, forfeitingUserId, onForfeit }) {
   const g = games.get(gameId);
   if (!g || g.state.winner != null) return;
   const loserIdx = g.state.players.findIndex((p) => p.userId === forfeitingUserId);
@@ -240,7 +247,7 @@ function forfeitGame({ gameId, forfeitingUserId, onForfeit }) {
   g.state.winner = winnerIdx;
   g.state.finishedAt = Date.now();
   g.state.history.push({ type: 'forfeit', player: loserIdx });
-  finalizeGame(g);
+  await finalizeGame(g);
   if (onForfeit) onForfeit({ game: g, winnerIdx, loserIdx });
 }
 
